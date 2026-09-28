@@ -1,0 +1,33 @@
+name: Auto Anime Shorts Publisher
+
+on:
+  schedule:
+    - cron: '0 */2 * * *' # Ab yeh bot har 2 ghante mein ek baar automatically chalega (Din mein 12 videos)
+  workflow_dispatch: # Aap ise GitHub Actions se manually bhi chala sakte hain
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: Install FFmpeg
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ffmpeg
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install yt-dlp openai-whisper cloudinary requests
+
+    - name: Run News Bot
+      run: |
+        python news_bot.py
