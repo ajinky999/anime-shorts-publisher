@@ -1,6 +1,7 @@
 import os
 import time
 import random
+import shutil
 import requests
 import subprocess
 import yt_dlp
@@ -28,8 +29,24 @@ BUFFER_CHANNELS = [
 ]
 COOKIES_PATH = "cookies.txt"
 
-# FFmpeg ka exact path
-FFMPEG_PATH = "C:\\ffmpeg\\bin\\ffmpeg.exe"
+# Video layout mode:
+#   "blur"     -> poori video dikhegi (koi crop nahi), 1080x1920 vertical frame mein,
+#                 upar/neeche blurred background. Facebook, YouTube Shorts, Instagram teeno accept karenge.
+#   "original" -> bilkul original size (horizontal video Facebook/YouTube Shorts par reject hogi)
+VIDEO_MODE = "blur"
+
+# FFmpeg path: pehle system PATH mein dhundhega, nahi mila to neeche wala path try karega
+FFMPEG_PATH = shutil.which("ffmpeg") or "C:\\ffmpeg\\bin\\ffmpeg.exe"
+if not os.path.exists(FFMPEG_PATH):
+    raise SystemExit(
+        f"❌ FFmpeg nahi mila: {FFMPEG_PATH}\n"
+        "Install karo: winget install Gyan.FFmpeg  (phir terminal naya kholo)"
+    )
+FFMPEG_DIR = os.path.dirname(FFMPEG_PATH)
+
+# Whisper andar se "ffmpeg" naam se call karta hai, isliye folder ko PATH mein jod do
+os.environ["PATH"] = FFMPEG_DIR + os.pathsep + os.environ.get("PATH", "")
+print(f"🎬 FFmpeg mila: {FFMPEG_PATH}")
 
 print("🧠 Loading Whisper AI Model...")
 whisper_model = whisper.load_model("base")
@@ -114,7 +131,7 @@ def download_video(search_keyword, temp_video):
         'outtmpl': temp_video,
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'merge_output_format': 'mp4',
-        'ffmpeg_location': "C:\\ffmpeg\\bin",
+        'ffmpeg_location': FFMPEG_DIR,
         'quiet': True,
         'no_warnings': True,
         'cookiefile': COOKIES_PATH if os.path.exists(COOKIES_PATH) else None,
@@ -125,7 +142,11 @@ def download_video(search_keyword, temp_video):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([video_url])
 
-        if os.path.exists(temp_video) and os.path.getsize(temp_video) > 500000:
+        if not os.path.exists(temp_video):
+            print("❌ Download ke baad file nahi bani (shayad merge fail hua).")
+        elif os.path.getsize(temp_video) <= 500000:
+            print("❌ File bahut choti hai, download adhura raha.")
+        else:
             print("✅ Download Completed with Audio Merged!")
             return True
     except Exception as e:
@@ -216,6 +237,35 @@ def push_to_buffer(local_file_path, caption):
             print(f"❌ Buffer API Error: {e}")
 
 
+def build_ffmpeg_command(temp_v, temp_s, out_v, has_srt):
+    escaped_srt = temp_s.replace(":", "\\:").replace("'", "\\'")
+    sub_style = (
+        f"subtitles='{escaped_srt}':force_style='FontSize=20,Bold=1,PrimaryColour=&H00FFFFFF,"
+        f"OutlineColour=&H00000000,BorderStyle=1,Outline=2,Alignment=2'"
+    )
+    base = [FFMPEG_PATH, "-y", "-i", temp_v, "-t", "60"]
+    encode = ["-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
+              "-c:a", "aac", "-b:a", "128k", out_v]
+
+    if VIDEO_MODE == "blur":
+        # Poori video (bina crop) 1080x1920 frame ke beech mein, peeche blurred copy
+        fc = (
+            "[0:v]fps=30,split=2[bg][fg];"
+            "[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=25:5[bgb];"
+            "[fg]scale=1080:1920:force_original_aspect_ratio=decrease:force_divisible_by=2[fgs];"
+            "[bgb][fgs]overlay=(W-w)/2:(H-h)/2"
+        )
+        if has_srt:
+            fc += "," + sub_style
+        return base + ["-filter_complex", fc] + encode
+
+    # "original": sirf even dimensions, ratio same
+    vf = "fps=30,scale=trunc(iw/2)*2:trunc(ih/2)*2"
+    if has_srt:
+        vf += "," + sub_style
+    return base + ["-vf", vf] + encode
+
+
 def process(keyword, output_name):
     temp_v = f"temp_{output_name}.mp4"
     temp_s = f"temp_{output_name}.srt"
@@ -227,28 +277,22 @@ def process(keyword, output_name):
     has_srt = False
     try:
         generate_srt(temp_v, temp_s)
-        has_srt = True
-    except Exception:
-        pass
+        has_srt = os.path.exists(temp_s)
+    except Exception as e:
+        print(f"⚠️ Subtitles skip (error): {e}")
 
-    escaped_srt = temp_s.replace(":", "\\:").replace("'", "\\'")
-    if has_srt and os.path.exists(temp_s):
-        vf = (
-            f"fps=30,scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
-            f"subtitles='{escaped_srt}':force_style='FontSize=20,Bold=1,PrimaryColour=&H00FFFFFF,"
-            f"OutlineColour=&H00000000,BorderStyle=1,Outline=2,Alignment=2'"
-        )
-    else:
-        vf = "fps=30,scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
-
-    print("🎞️ Rendering 1080p Vertical Video (Max 60s)...")
-    # Yahan "-c:a aac" ensure karega ki final video mein audio stream zaroor rahe
-    cmd = [FFMPEG_PATH, "-y", "-i", temp_v, "-t", "60", "-vf", vf, "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-c:a", "aac", "-b:a", "128k", out_v]
-    subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    print(f"🎞️ Rendering Video (Max 60s, mode: {VIDEO_MODE})...")
+    cmd = build_ffmpeg_command(temp_v, temp_s, out_v, has_srt)
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        print("❌ FFmpeg error:\n", result.stderr[-1500:])
+        return
 
     if os.path.exists(out_v) and os.path.getsize(out_v) > 1000000:
         caption = f"🔥 {keyword.title()} #anime #shorts #viral #reels"
         push_to_buffer(out_v, caption)
+    else:
+        print("❌ Output video nahi bani ya bahut choti hai.")
 
     for f in [temp_v, temp_s, out_v]:
         if os.path.exists(f):
